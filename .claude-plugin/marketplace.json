@@ -1,0 +1,18 @@
+{
+    "name": "arx",
+    "owner": {
+        "name": "arx",
+        "email": "gabrielarce@arxoperations.com"
+    },
+    "plugins": [
+        {
+            "name": "independent-reviewer",
+            "source": "./independent-reviewer",
+            "description": "Lleva a cabo una revision independiente de los cambios desde el ultimo commit.",
+            "version": "1.0.0",
+            "author": {
+                "name": "Gabriel Arce Molina"
+            }
+        }
+    ]   
+}
