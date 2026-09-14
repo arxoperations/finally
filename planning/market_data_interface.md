@@ -1,161 +1,118 @@
-# Diseño: Interfaz de Datos de Mercado
+# Contrato de Datos de Mercado
 
-## 1. Objetivo
+## Estado y fuente canónica
 
-`planning/PLAN.md` (sección 6) exige que el simulador y el cliente de Massive implementen **la misma interfaz abstracta**, de forma que el resto del backend (caché de precios, streaming SSE, watchlist) sea agnóstico a la fuente de datos. Este documento concreta cómo construir esa interfaz.
+Este documento describe el contrato que ya implementa y prueba
+`backend/app/market_data/`. No propone una interfaz alternativa. La referencia
+de diseño ampliada es `planning/market_data_design.md`; cuando ambos difieran,
+el código probado y este documento prevalecen.
 
-## 2. Patrón: Protocol (contrato público) + ABC (base interna compartida)
+El módulo existente tiene 47 tests unitarios. FastAPI, SQLite y las rutas SSE
+aún no existen: deben integrarse contra este contrato, sin refactorizar la
+biblioteca de datos de mercado.
 
-La investigación sobre diseño de interfaces en Python moderno apunta a un patrón híbrido:
+## Modelo de datos
 
-- Un **`Protocol`** define el contrato público que consume el resto de la app (tipado estructural — cualquier clase con los métodos correctos lo cumple, sin herencia obligatoria).
-- Una **`ABC`** interna (`BaseMarketDataProvider`) implementa el código compartido entre `SimulatedProvider` y `MassiveProvider` (gestión del caché, lifecycle de la tarea en background, lógica de "añadir ticker en caliente").
-
-Esto evita over-engineering: no necesitamos un framework de plugins, solo dos implementaciones concretas que comparten bastante lógica de orquestación.
-
-```python
-from typing import Protocol, AsyncIterator
-
-class MarketDataProvider(Protocol):
-    async def start(self, tickers: set[str]) -> None: ...
-    async def add_ticker(self, ticker: str) -> None: ...
-    def get_latest(self, ticker: str) -> PriceTick | None: ...
-    def subscribe(self) -> AsyncIterator[PriceTick]: ...
-```
-
-## 3. Modelo de datos
+`PriceTick` (`types.py`) es el valor que un proveedor comunica al resto de la
+aplicación:
 
 ```python
-from dataclasses import dataclass
-
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PriceTick:
     ticker: str
     price: float
-    previous_price: float
-    timestamp: float  # epoch seconds
-    direction: str     # "up" | "down" | "flat"
+    prev_price: float
+    timestamp: str       # ISO 8601 UTC
+    direction: Direction # "up" | "down" | "flat"
 ```
 
-`direction` se deriva de `price` vs `previous_price` y es lo que el frontend usa para el destello verde/rojo. Se calcula una sola vez en el provider, no en cada consumidor.
+`PriceTick.create()` centraliza el cálculo de dirección y el formato que se
+emite por SSE se obtiene con `to_sse_dict()`.
 
-## 4. Caché de precios compartida
+### Gap conocido: `day_change_percent`
 
-Un único objeto en memoria, propiedad del provider activo:
+`PLAN.md` (secciones 6 y 8) exige que cada evento SSE y cada entrada de
+`GET /api/watchlist` incluyan `day_change_percent`, pero ni `PriceTick` ni
+`CachedPrice` lo modelan hoy: `to_sse_dict()` solo produce `ticker`, `price`,
+`prev_price`, `timestamp` y `direction`. Esto es una omisión pendiente, no una
+contradicción a resolver a favor de uno u otro documento.
+
+Al implementar la integración FastAPI/SSE, quien la construya debe decidir e
+implementar dónde vive el precio de referencia de sesión (semilla del día para
+el simulador; `prevDay.c` de Massive) y cómo se deriva `day_change_percent` a
+partir de él — extendiendo `PriceTick`/`CachedPrice` en `market_data/`, o
+enriqueciendo el payload en la capa de wiring/rutas por encima de la
+biblioteca ya probada. Cualquiera de las dos opciones es válida siempre que el
+campo llegue tal como `PLAN.md` lo especifica; lo que no es válido es dejarlo
+sin resolver silenciosamente.
+
+## Proveedor
+
+`MarketDataProvider` en `base.py` es una `ABC` con callback asíncrono. No se
+usa un `Protocol`, ni el proveedor expone `get_latest()` o `subscribe()`.
+
+```python
+TickCallback = Callable[[PriceTick], Awaitable[None]]
+
+class MarketDataProvider(ABC):
+    def __init__(self, on_tick: TickCallback) -> None: ...
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+    def add_ticker(self, ticker: str) -> None: ...
+    def remove_ticker(self, ticker: str) -> None: ...
+    @property
+    def tickers(self) -> frozenset[str]: ...
+```
+
+Implementaciones:
+
+- `MarketSimulator`: proveedor GBM predeterminado; `tick_once()` permite
+  avanzar de forma determinista en tests.
+- `MassiveMarketDataProvider`: polling REST por lotes; `poll_once()` permite
+  probar el parseo sin temporizadores.
+
+`factory.build_market_data_provider(on_tick)` selecciona Massive solo si
+`MASSIVE_API_KEY` contiene un valor no vacío. Las rutas no deben construir
+proveedores concretos directamente.
+
+## Caché y difusión
+
+`PriceCache` (`cache.py`) reúne las dos responsabilidades que algunos diseños
+anteriores separaban:
 
 ```python
 class PriceCache:
-    def __init__(self) -> None:
-        self._latest: dict[str, PriceTick] = {}
-        self._lock = asyncio.Lock()
-
-    async def set(self, tick: PriceTick) -> None:
-        async with self._lock:
-            self._latest[tick.ticker] = tick
-
-    def get(self, ticker: str) -> PriceTick | None:
-        return self._latest.get(ticker)
+    async def update(self, tick: PriceTick) -> None: ...
+    def snapshot(self) -> dict[str, CachedPrice]: ...
+    def get(self, ticker: str) -> CachedPrice | None: ...
+    def subscribe(self) -> asyncio.Queue[PriceTick]: ...
+    def unsubscribe(self, queue: asyncio.Queue[PriceTick]) -> None: ...
 ```
 
-- Lectura sin lock (dict.get es seguro en CPython para este caso de uso de un solo escritor).
-- Escritura con lock para evitar carreras si en el futuro hay múltiples escritores.
-- Vive como singleton a nivel de app (`app.state.price_cache`), inicializado en el `lifespan` de FastAPI.
+- `update()` guarda el último precio y hace fan-out sin bloquear al proveedor.
+- Una cola llena se descarta para desconectar al consumidor lento.
+- `snapshot()` devuelve copias independientes de los valores cacheados.
+- La instancia compartida es `price_cache`; `wiring.on_tick` es el callback que
+  conecta cualquier proveedor con ella.
 
-## 5. Distribución a consumidores: caché + cola de difusión (broadcast)
+No crear un `Broadcaster` paralelo ni un segundo caché al implementar SSE.
 
-El SSE necesita "empujar" eventos a clientes conectados, no solo leer el último valor. Patrón productor/consumidores con `asyncio.Queue` por cliente conectado:
+## Integración con FastAPI y SSE
 
-```python
-class Broadcaster:
-    def __init__(self) -> None:
-        self._subscribers: list[asyncio.Queue[PriceTick]] = []
+En el `lifespan` de FastAPI:
 
-    def subscribe(self) -> asyncio.Queue[PriceTick]:
-        q: asyncio.Queue[PriceTick] = asyncio.Queue(maxsize=100)
-        self._subscribers.append(q)
-        return q
+1. Inicializar la base de datos y leer la unión de watchlist y posiciones.
+2. Construir una sola vez el proveedor con `build_market_data_provider(on_tick)`.
+3. Añadir los tickers iniciales y ejecutar `await provider.start()`.
+4. En el apagado, ejecutar `await provider.stop()`.
 
-    async def publish(self, tick: PriceTick) -> None:
-        for q in self._subscribers:
-            q.put_nowait(tick)  # descarta si el cliente va lento; no bloquea el productor
-```
+Las altas/bajas de watchlist llaman respectivamente a `add_ticker()` y
+`remove_ticker()`. Al abrir/cerrar una posición se debe recalcular la unión de
+watchlist y posiciones: no se puede eliminar del proveedor un ticker que sigue
+siendo necesario para el P&L.
 
-Cada conexión SSE (`GET /api/stream/prices`) llama a `subscribe()`, filtra por la unión de watchlist + posiciones abiertas de esa sesión, y hace `yield` de cada tick como evento SSE hasta que el cliente se desconecta (momento en que se elimina su cola).
-
-## 6. La tarea en segundo plano (background task)
-
-Tanto `SimulatedProvider` como `MassiveProvider` corren **una única tarea `asyncio`** lanzada en el `lifespan` de FastAPI, que en cada tick:
-
-1. Calcula/obtiene los nuevos precios para todos los tickers vigilados.
-2. Escribe cada uno en `PriceCache`.
-3. Publica cada uno en `Broadcaster`.
-4. Duerme hasta el siguiente intervalo (`~500ms` simulador, `~15s` Massive nivel gratuito).
-
-```python
-class BaseMarketDataProvider(ABC):
-    def __init__(self, cache: PriceCache, broadcaster: Broadcaster) -> None:
-        self._cache = cache
-        self._broadcaster = broadcaster
-        self._tickers: set[str] = set()
-        self._task: asyncio.Task | None = None
-
-    async def start(self, tickers: set[str]) -> None:
-        self._tickers = set(tickers)
-        self._task = asyncio.create_task(self._run())
-
-    async def _run(self) -> None:
-        while True:
-            ticks = await self._fetch_ticks(self._tickers)
-            for tick in ticks:
-                await self._cache.set(tick)
-                await self._broadcaster.publish(tick)
-            await asyncio.sleep(self.interval_seconds)
-
-    @abstractmethod
-    async def _fetch_ticks(self, tickers: set[str]) -> list[PriceTick]: ...
-
-    @property
-    @abstractmethod
-    def interval_seconds(self) -> float: ...
-
-    async def add_ticker(self, ticker: str) -> None:
-        self._tickers.add(ticker)
-```
-
-`SimulatedProvider._fetch_ticks` calcula el siguiente paso GBM (ver `planning/market_simulator.md`). `MassiveProvider._fetch_ticks` hace la llamada HTTP de snapshot por lotes (ver `planning/massive_api.md`).
-
-## 7. Añadir un ticker en caliente
-
-`add_ticker(ticker)` se invoca desde el endpoint `POST /api/watchlist` y desde las acciones de watchlist del LLM. El comportamiento difiere por implementación pero el contrato es idéntico:
-
-- `SimulatedProvider`: genera un precio semilla plausible y empieza a simular ese ticker en el siguiente tick.
-- `MassiveProvider`: simplemente añade el ticker al conjunto; ya se incluirá en la próxima llamada de snapshot por lotes (no requiere lógica especial de "seed").
-
-Esto es exactamente el tipo de comportamiento que justifica tener una interfaz común: la lógica de la ruta de la API no necesita saber cuál de las dos implementaciones está activa.
-
-## 8. Selección de implementación (factory)
-
-```python
-def build_market_data_provider(cache: PriceCache, broadcaster: Broadcaster) -> MarketDataProvider:
-    if api_key := os.environ.get("MASSIVE_API_KEY"):
-        return MassiveProvider(cache, broadcaster, api_key=api_key)
-    return SimulatedProvider(cache, broadcaster)
-```
-
-Se llama una sola vez, en el `lifespan` de la app. El resto del código nunca importa `SimulatedProvider` ni `MassiveProvider` directamente — solo conoce `MarketDataProvider` (el `Protocol`) y `PriceCache`/`Broadcaster`.
-
-## 9. Por qué esta forma y no otra
-
-| Alternativa descartada | Motivo |
-|---|---|
-| Una clase `ABC` pura sin `Protocol` | Funciona igual de bien aquí; se documenta el híbrido porque es el estándar moderno, pero si se prefiere simplicidad, una sola `ABC` abstracta es una simplificación válida y razonable — no es una elección incorrecta dado que solo hay dos implementaciones. |
-| WebSockets internos en lugar de SSE | Ya descartado en el PLAN; no aporta nada dado que el flujo es unidireccional servidor→cliente. |
-| Cada conexión SSE haciendo su propio polling a Massive/simulador | Multiplicaría las llamadas a la API externa por cada pestaña de navegador abierta; rompe el límite de 5 llamadas/min del nivel gratuito. El caché + broadcaster centralizado garantiza **una sola fuente de verdad y una sola tarea de fondo**, sin importar cuántos clientes SSE estén conectados. |
-| Pub/sub con Redis u otro broker externo | Innecesario para un solo proceso, un solo usuario, sin necesidad de escalar horizontalmente (ver PLAN.md sección 3: SQLite + contenedor único). `asyncio.Queue` en memoria es suficiente y no añade infraestructura. |
-
-## Fuentes
-
-- [Abstract Base Classes and Protocols: What Are They? When To Use Them?](https://jellis18.github.io/post/2022-01-11-abc-vs-protocol/)
-- [Interfaces: abc vs. Protocols](https://sinavski.com/post/1_abc_vs_protocols/)
-- [Modern Python Interfaces: ABC, Protocol, or Both?](https://tconsta.medium.com/python-interfaces-abc-protocol-or-both-3c5871ea6642)
-- [Python Protocols: Leveraging Structural Subtyping – Real Python](https://realpython.com/python-protocol/)
+`GET /api/stream/prices` se suscribe a `price_cache`, emite primero el
+snapshot disponible y filtra los ticks a la unión de watchlist y posiciones
+del usuario. El scheduler SSE puede reemitir el caché cada ~500 ms, como exige
+`PLAN.md`; debe conservar el timestamp original del tick para que el frontend
+deduplique las muestras de sparkline.

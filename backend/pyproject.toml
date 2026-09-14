@@ -5,6 +5,7 @@ description = "FinAlly backend (FastAPI) — market data, portfolio, watchlist a
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
+    "pydantic-settings>=2.0",
 ]
 
 [dependency-groups]
