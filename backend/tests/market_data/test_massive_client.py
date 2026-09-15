@@ -149,6 +149,38 @@ async def test_run_loop_swallows_http_errors_and_keeps_polling():
     assert call_count >= 2
 
 
+async def test_poll_once_uses_todays_change_perc_from_snapshot():
+    payload = snapshot_payload(
+        {"AAPL": {"lastTrade": {"p": 189.72}, "todaysChangePerc": 1.35, "prevDay": {"c": 187.9}}}
+    )
+    provider, _ = make_provider(lambda request: httpx.Response(200, json=payload))
+    provider.add_ticker("AAPL")
+
+    ticks = await provider.poll_once()
+
+    assert ticks[0].day_change_percent == 1.35
+
+
+async def test_poll_once_derives_day_change_percent_from_prev_day_close_when_missing():
+    payload = snapshot_payload({"AAPL": {"lastTrade": {"p": 191.0}, "prevDay": {"c": 190.0}}})
+    provider, _ = make_provider(lambda request: httpx.Response(200, json=payload))
+    provider.add_ticker("AAPL")
+
+    ticks = await provider.poll_once()
+
+    assert ticks[0].day_change_percent == pytest.approx((191.0 - 190.0) / 190.0 * 100)
+
+
+async def test_poll_once_sets_day_change_percent_to_none_without_any_reference():
+    payload = snapshot_payload({"AAPL": {"lastTrade": {"p": 191.0}}})
+    provider, _ = make_provider(lambda request: httpx.Response(200, json=payload))
+    provider.add_ticker("AAPL")
+
+    ticks = await provider.poll_once()
+
+    assert ticks[0].day_change_percent is None
+
+
 async def test_stop_closes_the_http_client():
     provider, _ = make_provider(lambda request: httpx.Response(200, json=snapshot_payload({})))
     await provider.start()

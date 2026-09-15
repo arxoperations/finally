@@ -29,6 +29,9 @@ class MarketSimulator(MarketDataProvider):
         super().__init__(on_tick)
         self._rng = random.Random(seed)
         self._prices: dict[str, float] = {t: cfg.seed_price for t, cfg in DEFAULT_TICKERS.items()}
+        # Precio de referencia de sesión ("del día"), fijado una vez por ticker y
+        # nunca reescrito hasta el siguiente reinicio del proceso (PLAN.md §6).
+        self._day_reference_price: dict[str, float] = dict(self._prices)
         self._drift: dict[str, float] = {t: cfg.drift for t, cfg in DEFAULT_TICKERS.items()}
         self._volatility: dict[str, float] = {t: cfg.volatility for t, cfg in DEFAULT_TICKERS.items()}
         self._sector: dict[str, str] = {t: cfg.sector for t, cfg in DEFAULT_TICKERS.items()}
@@ -50,7 +53,11 @@ class MarketSimulator(MarketDataProvider):
                 self._drift[ticker] = GENERIC_TICKER_DRIFT
                 self._volatility[ticker] = GENERIC_TICKER_VOLATILITY
                 self._sector[ticker] = GENERIC_TICKER_SECTOR
+            self._day_reference_price[ticker] = self._prices[ticker]
         self._tickers.add(ticker)
+
+    def day_reference_price(self, ticker: str) -> float | None:
+        return self._day_reference_price.get(ticker.upper())
 
     def remove_ticker(self, ticker: str) -> None:
         self._tickers.discard(ticker.upper())
@@ -112,8 +119,16 @@ class MarketSimulator(MarketDataProvider):
             new_price = max(new_price, 0.01)
             self._prices[ticker] = new_price
 
-            tick = PriceTick.create(ticker, new_price, prev)
+            tick = PriceTick.create(
+                ticker, new_price, prev, day_change_percent=self._day_change_percent(ticker, new_price)
+            )
             ticks.append(tick)
             await self._emit(tick)
 
         return ticks
+
+    def _day_change_percent(self, ticker: str, price: float) -> float | None:
+        reference = self._day_reference_price.get(ticker)
+        if not reference:
+            return None
+        return (price - reference) / reference * 100

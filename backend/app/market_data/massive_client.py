@@ -88,22 +88,24 @@ class MassiveMarketDataProvider(MarketDataProvider):
         payload = resp.json()
 
         ticks: list[PriceTick] = []
-        for ticker, price in self._parse_response(payload):
+        for ticker, price, day_change_percent in self._parse_response(payload):
             prev = self._prev_prices.get(ticker, price)
-            tick = PriceTick.create(ticker, price, prev)
+            tick = PriceTick.create(ticker, price, prev, day_change_percent=day_change_percent)
             self._prev_prices[ticker] = price
             ticks.append(tick)
             await self._emit(tick)
         return ticks
 
     @staticmethod
-    def _parse_response(payload: dict) -> list[tuple[str, float]]:
-        """Adapta la forma de la respuesta de snapshot de Massive a (ticker, price).
+    def _parse_response(payload: dict) -> list[tuple[str, float, float | None]]:
+        """Adapta la respuesta de snapshot de Massive a (ticker, price, day_change_percent).
 
-        Prioriza el último trade, y recurre al cierre del día / cierre anterior
-        si el último trade no está disponible (mercado cerrado, plan con retraso).
+        El precio prioriza el último trade, y recurre al cierre del día / cierre
+        anterior si el último trade no está disponible (mercado cerrado, plan con
+        retraso). `day_change_percent` usa `todaysChangePerc` del snapshot cuando
+        está presente, y si no, se deriva del cierre del día anterior (PLAN.md §6).
         """
-        results: list[tuple[str, float]] = []
+        results: list[tuple[str, float, float | None]] = []
         for item in payload.get("tickers", []):
             ticker = item.get("ticker")
             if not ticker:
@@ -113,6 +115,15 @@ class MassiveMarketDataProvider(MarketDataProvider):
                 or item.get("day", {}).get("c")
                 or item.get("prevDay", {}).get("c")
             )
-            if price is not None:
-                results.append((ticker, float(price)))
+            if price is None:
+                continue
+            price = float(price)
+
+            day_change_percent = item.get("todaysChangePerc")
+            if day_change_percent is None:
+                prev_close = item.get("prevDay", {}).get("c")
+                if prev_close:
+                    day_change_percent = (price - float(prev_close)) / float(prev_close) * 100
+
+            results.append((ticker, price, day_change_percent))
         return results

@@ -30,6 +30,19 @@ async def test_snapshot_returns_a_copy(cache: PriceCache):
     assert cache.get("AAPL").price == 191.0
 
 
+async def test_update_stores_day_change_percent(cache: PriceCache):
+    tick = PriceTick.create("AAPL", 191.0, 190.0, day_change_percent=2.5)
+    await cache.update(tick)
+
+    assert cache.get("AAPL").day_change_percent == 2.5
+
+
+async def test_snapshot_includes_day_change_percent(cache: PriceCache):
+    await cache.update(PriceTick.create("AAPL", 191.0, 190.0, day_change_percent=2.5))
+
+    assert cache.snapshot()["AAPL"].day_change_percent == 2.5
+
+
 def test_get_returns_none_for_unknown_ticker(cache: PriceCache):
     assert cache.get("UNKNOWN") is None
 

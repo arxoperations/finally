@@ -16,9 +16,16 @@ class PriceTick:
     prev_price: float
     timestamp: str  # ISO 8601, UTC
     direction: Direction
+    day_change_percent: float | None = None  # % vs. precio de referencia de la sesión
 
     @classmethod
-    def create(cls, ticker: str, price: float, prev_price: float) -> "PriceTick":
+    def create(
+        cls,
+        ticker: str,
+        price: float,
+        prev_price: float,
+        day_change_percent: float | None = None,
+    ) -> "PriceTick":
         if price > prev_price:
             direction = Direction.UP
         elif price < prev_price:
@@ -31,6 +38,9 @@ class PriceTick:
             prev_price=round(prev_price, 4),
             timestamp=datetime.now(timezone.utc).isoformat(),
             direction=direction,
+            day_change_percent=(
+                round(day_change_percent, 4) if day_change_percent is not None else None
+            ),
         )
 
     def to_sse_dict(self) -> dict:
@@ -40,4 +50,5 @@ class PriceTick:
             "prev_price": self.prev_price,
             "timestamp": self.timestamp,
             "direction": self.direction.value,
+            "day_change_percent": self.day_change_percent,
         }

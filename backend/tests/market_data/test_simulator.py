@@ -128,3 +128,58 @@ async def test_start_and_stop_runs_background_loop():
 async def test_stop_is_safe_to_call_when_never_started():
     sim, _ = make_simulator()
     await sim.stop()
+
+
+async def test_tick_once_computes_day_change_percent_from_seed_reference():
+    sim, _ = make_simulator()
+
+    ticks = await sim.tick_once()
+
+    for tick in ticks:
+        seed = DEFAULT_TICKERS[tick.ticker].seed_price
+        expected = round((tick.price - seed) / seed * 100, 4)
+        assert tick.day_change_percent == expected
+
+
+async def test_day_reference_price_stays_fixed_across_ticks():
+    sim, _ = make_simulator()
+    reference_before = sim.day_reference_price("AAPL")
+
+    for _ in range(10):
+        await sim.tick_once()
+
+    assert sim.day_reference_price("AAPL") == reference_before
+    assert reference_before == DEFAULT_TICKERS["AAPL"].seed_price
+
+
+def test_new_known_ticker_uses_its_seed_price_as_day_reference():
+    sim, _ = make_simulator()
+    sim.remove_ticker("NVDA")
+
+    sim.add_ticker("nvda")
+    assert sim.day_reference_price("NVDA") == DEFAULT_TICKERS["NVDA"].seed_price
+
+
+def test_new_unknown_ticker_uses_its_initial_price_as_day_reference():
+    sim, _ = make_simulator()
+    sim.add_ticker("PYPL")
+
+    assert sim.day_reference_price("PYPL") == sim.current_price("PYPL")
+
+
+async def test_readding_a_ticker_keeps_its_original_day_reference():
+    sim, _ = make_simulator()
+    sim.add_ticker("PYPL")
+    reference = sim.day_reference_price("PYPL")
+
+    sim.remove_ticker("PYPL")
+    for _ in range(5):
+        await sim.tick_once()
+    sim.add_ticker("PYPL")
+
+    assert sim.day_reference_price("PYPL") == reference
+
+
+def test_day_reference_price_is_none_for_unknown_ticker():
+    sim, _ = make_simulator()
+    assert sim.day_reference_price("NOPE") is None

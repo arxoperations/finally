@@ -24,27 +24,25 @@ class PriceTick:
     prev_price: float
     timestamp: str       # ISO 8601 UTC
     direction: Direction # "up" | "down" | "flat"
+    day_change_percent: float | None = None  # % vs. precio de referencia de la sesión
 ```
 
 `PriceTick.create()` centraliza el cálculo de dirección y el formato que se
-emite por SSE se obtiene con `to_sse_dict()`.
+emite por SSE se obtiene con `to_sse_dict()`, que ahora incluye
+`day_change_percent`. `CachedPrice` (`cache.py`) espeja el mismo campo.
 
-### Gap conocido: `day_change_percent`
+`day_change_percent` se resolvió dentro de la propia biblioteca de datos de
+mercado (no en una capa de wiring/rutas superior):
 
-`PLAN.md` (secciones 6 y 8) exige que cada evento SSE y cada entrada de
-`GET /api/watchlist` incluyan `day_change_percent`, pero ni `PriceTick` ni
-`CachedPrice` lo modelan hoy: `to_sse_dict()` solo produce `ticker`, `price`,
-`prev_price`, `timestamp` y `direction`. Esto es una omisión pendiente, no una
-contradicción a resolver a favor de uno u otro documento.
-
-Al implementar la integración FastAPI/SSE, quien la construya debe decidir e
-implementar dónde vive el precio de referencia de sesión (semilla del día para
-el simulador; `prevDay.c` de Massive) y cómo se deriva `day_change_percent` a
-partir de él — extendiendo `PriceTick`/`CachedPrice` en `market_data/`, o
-enriqueciendo el payload en la capa de wiring/rutas por encima de la
-biblioteca ya probada. Cualquiera de las dos opciones es válida siempre que el
-campo llegue tal como `PLAN.md` lo especifica; lo que no es válido es dejarlo
-sin resolver silenciosamente.
+- **Simulador:** cada ticker fija su precio de referencia de sesión
+  (`MarketSimulator.day_reference_price(ticker)`) la primera vez que se ve —
+  al arrancar el proceso para los tickers por defecto, o al añadirse por
+  primera vez para tickers dinámicos — y no cambia hasta el siguiente
+  reinicio, tal como exige `PLAN.md` §6. Re-añadir un ticker previamente visto
+  conserva su referencia original.
+- **Massive:** se usa `todaysChangePerc` del snapshot si está presente: si no,
+  se deriva de `prevDay.c` y el precio actual. Si no hay ninguna referencia
+  disponible, el campo es `None` en vez de inventar un valor.
 
 ## Proveedor
 
